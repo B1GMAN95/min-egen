@@ -7,7 +7,11 @@ import WebSocket, { WebSocketServer } from "ws";
  */
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-realtime";
-const PORT = Number(process.env.PORT || 3000); // ✅ Railway uses PORT
+const PORT = Number(process.env.PORT || 3000);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`running on :${PORT}`);
+});
+
 
 /**
  * Safety logs (so we see real errors)
