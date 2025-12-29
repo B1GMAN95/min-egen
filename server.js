@@ -65,21 +65,22 @@ wss.on("connection", (twilioWs) => {
     console.log("✅ Connected to OpenAI Realtime");
 
     // Viktig: session.type MUST være "realtime"
-    openaiWs.send(
-      JSON.stringify({
-        type: "session.update",
-        session: {
-          modalities: ["audio"],
-          input_audio_format: "g711_ulaw",
-          output_audio_format: "g711_ulaw",
-          turn_detection: { type: "server_vad" },
-          instructions:
-            "Du er TaskSync AI, en profesjonell norsk resepsjonist. " +
-            "Snakk naturlig norsk. Svar kort og vennlig. " +
-            "Start med: 'Hei! Jeg er TaskSync AI. Hvordan kan jeg hjelpe deg i dag?'",
-        },
-      })
-    );
+openaiWs.send(
+  JSON.stringify({
+    type: "session.update",
+    session: {
+      modalities: ["audio"],
+      input_audio_format: "g711_ulaw",
+      output_audio_format: "g711_ulaw",
+      turn_detection: { type: "server_vad" },
+      instructions:
+        "Du er TaskSync AI, en profesjonell norsk resepsjonist. " +
+        "Snakk naturlig norsk, kort og vennlig. " +
+        "Start alltid med: 'Hei! Jeg er TaskSync AI. Hvordan kan jeg hjelpe deg i dag?'",
+    },
+  })
+);
+
 
     // Start samtalen med en gang
     openaiWs.send(JSON.stringify({ type: "response.create" }));
