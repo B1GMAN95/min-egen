@@ -4,22 +4,26 @@ import WebSocket, { WebSocketServer } from "ws";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-realtime";
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 TaskSync AI voice bridge running on :${PORT}`);
+const PORT = Number(process.env.PORT || 3000);
+
+process.on("uncaughtException", (err) => {
+  console.error("🔥 uncaughtException:", err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("🔥 unhandledRejection:", reason);
 });
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
+app.get("/", (_req, res) => res.status(200).send("TaskSync AI voice bridge is running"));
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 app.post("/twilio/voice", (req, res) => {
   const host = req.headers["x-forwarded-host"] || req.headers.host;
   const streamUrl = `wss://${host}/twilio/stream`;
 
-  // No Twilio <Say> – pure stream to AI
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -31,11 +35,9 @@ app.post("/twilio/voice", (req, res) => {
   res.status(200).send(twiml);
 });
 
-app.get("/twilio/voice", (_req, res) =>
-  res.status(200).send("Twilio voice endpoint (POST required).")
-);
-
 const server = http.createServer(app);
+
+// Twilio websocket endpoint
 const wss = new WebSocketServer({ server, path: "/twilio/stream" });
 
 wss.on("connection", (twilioWs) => {
@@ -80,7 +82,6 @@ wss.on("connection", (twilioWs) => {
   openaiWs.on("open", () => {
     console.log("✅ Connected to OpenAI Realtime");
 
-    // Your account requires ["audio","text"] – not audio-only
     sendToOpenAI({
       type: "session.update",
       session: {
@@ -98,14 +99,8 @@ wss.on("connection", (twilioWs) => {
 
     openaiReady = true;
 
-    // Force first greeting immediately
-    sendToOpenAI({
-      type: "response.create",
-      response: {
-        // some schemas accept this; if ignored, it's fine
-        modalities: ["audio", "text"],
-      },
-    });
+    // Start samtalen umiddelbart
+    sendToOpenAI({ type: "response.create" });
   });
 
   openaiWs.on("message", (raw) => {
@@ -121,39 +116,18 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
-    // --- AUDIO HANDLING (support both schemas) ---
-    // Schema A:
-    if (msg.type === "response.output_audio.delta" && msg.delta) {
-      console.log("🔊 OpenAI audio delta (output_audio)");
+    // Support both event names for audio delta
+    if ((msg.type === "response.output_audio.delta" || msg.type === "response.audio.delta") && msg.delta) {
+      console.log("🔊 OpenAI audio delta");
       sendAudioToTwilio(msg.delta);
       return;
     }
 
-    // Schema B (older):
-    if (msg.type === "response.audio.delta" && msg.delta) {
-      console.log("🔊 OpenAI audio delta (audio)");
-      sendAudioToTwilio(msg.delta);
-      return;
-    }
-
-    // Some variants:
-    if (msg.type === "response.output_audio.delta" && msg.audio) {
-      console.log("🔊 OpenAI audio (output_audio.audio)");
-      sendAudioToTwilio(msg.audio);
-      return;
-    }
-
-    // Trigger response when OpenAI detects end of speech (if emitted)
     if (msg.type === "input_audio_buffer.speech_stopped") {
       console.log("🟣 speech_stopped -> response.create");
       sendToOpenAI({ type: "response.create" });
       return;
     }
-
-    // Helpful debug without spamming
-    if (msg.type === "session.updated") console.log("🟣 session.updated");
-    if (msg.type === "response.created") console.log("🟣 response.created");
-    if (msg.type === "response.done") console.log("🟣 response.done");
   });
 
   openaiWs.on("close", (code, reason) => {
@@ -166,7 +140,6 @@ wss.on("connection", (twilioWs) => {
     try { twilioWs.close(); } catch {}
   });
 
-  // Twilio -> OpenAI
   twilioWs.on("message", (raw) => {
     let data;
     try {
@@ -186,17 +159,13 @@ wss.on("connection", (twilioWs) => {
       if (!payload) return;
       if (!openaiReady) return;
 
-      sendToOpenAI({
-        type: "input_audio_buffer.append",
-        audio: payload,
-      });
+      sendToOpenAI({ type: "input_audio_buffer.append", audio: payload });
       return;
     }
 
     if (data.event === "stop") {
       console.log("🛑 Twilio stream stop");
       try { openaiWs.close(); } catch {}
-      return;
     }
   });
 
@@ -204,13 +173,9 @@ wss.on("connection", (twilioWs) => {
     console.log("⚠️ Twilio WS closed");
     try { openaiWs.close(); } catch {}
   });
-
-  twilioWs.on("error", (e) => {
-    console.error("❌ Twilio WS error", e?.message || e);
-    try { openaiWs.close(); } catch {}
-  });
 });
 
-server.listen(PORT, () => {
+// 🔥 Railway-safe listen
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 TaskSync AI voice bridge running on :${PORT}`);
 });
