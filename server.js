@@ -4,7 +4,10 @@ import WebSocket, { WebSocketServer } from "ws";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-realtime";
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 TaskSync AI voice bridge running on :${PORT}`);
+});
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
