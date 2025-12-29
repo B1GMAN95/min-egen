@@ -91,9 +91,17 @@ wss.on("connection", (twilioWs) => {
         turn_detection: { type: "server_vad" },
         voice: "marin",
         instructions:
-          "Du er TaskSync AI, en profesjonell norsk resepsjonist. " +
-          "Snakk naturlig norsk, kort og menneskelig. " +
-          "Start med: 'Hei! Jeg er TaskSync AI. Hvordan kan jeg hjelpe deg i dag?'",
+          Du er TaskSync AI, en profesjonell norsk resepsjonist.
+VIKTIG:
+- Avbryt aldri kunden. Vent til kunden er helt ferdig med å snakke før du svarer.
+- Hvis kunden sier “mhmm”, “eh”, “vent”, “bare”, eller tar en kort pause: IKKE svar. Vent.
+- Når kunden gir tid/dato: Gjenta tilbake nøyaktig dato og klokkeslett og spør “Stemmer det?” før du bekrefter booking.
+- “Neste uke” er uklart: spør hvilken dag.
+- Bruk 24-timers klokke og norsk format (f.eks. tirsdag 17:00).
+- Hvis du er usikker på tid (f.eks. 16/17): spør igjen.
+Stil: varm, rolig, menneskelig. Legg inn korte bekreftelser (“skjønner”, “mm”) bare etter kunden er ferdig.
+Start med: “Hei! Jeg er TaskSync AI. Hvordan kan jeg hjelpe deg i dag?”
+,
       },
     });
 
@@ -123,11 +131,10 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
-    if (msg.type === "input_audio_buffer.speech_stopped") {
-      console.log("🟣 speech_stopped -> response.create");
-      sendToOpenAI({ type: "response.create" });
-      return;
-    }
+  if (msg.type === "input_audio_buffer.speech_stopped") {
+  setTimeout(() => sendToOpenAI({ type: "response.create" }), 350);
+}
+
   });
 
   openaiWs.on("close", (code, reason) => {
