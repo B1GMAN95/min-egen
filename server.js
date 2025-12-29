@@ -1,143 +1,160 @@
-import express from "express";
-import http from "http";
-import WebSocket, { WebSocketServer } from "ws";
+/**
+ * TaskSync AI — Twilio Media Streams <-> OpenAI Realtime bridge (Railway)
+ *
+ * Endpoints:
+ *  - GET  /health           -> ok
+ *  - POST /twilio/voice     -> TwiML that starts a Media Stream to /twilio/stream
+ *  - WS   /twilio/stream    -> Twilio Media Stream websocket
+ *
+ * Env:
+ *  - OPENAI_API_KEY
+ *  - OPENAI_MODEL (default: gpt-realtime)
+ *  - PORT (default: 8080)
+ */
+
+const http = require("http");
+const express = require("express");
+const WebSocket = require("ws");
+
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-realtime";
+const PORT = process.env.PORT || 8080;
+
+if (!OPENAI_API_KEY) {
+  console.error("Missing env OPENAI_API_KEY");
+}
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-/**
- * Twilio webhook when call comes in.
- * Respond with TwiML that starts a Media Stream to our WebSocket.
- */
+app.get("/health", (_req, res) => res.status(200).send("ok"));
+
+// Twilio will POST here when a call comes in.
+// We respond with TwiML that opens a Media Stream to our websocket.
 app.post("/twilio/voice", (req, res) => {
   const host = req.headers["x-forwarded-host"] || req.headers.host;
   const streamUrl = `wss://${host}/twilio/stream`;
 
-  const twiml = `
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say language="nb-NO" voice="alice">
-    Hei! Du snakker med TaskSync AI. Ett øyeblikk mens jeg kobler opp.
-  </Say>
+  <Say language="nb-NO">Hei! Du snakker med TaskSync AI.</Say>
   <Connect>
     <Stream url="${streamUrl}" />
   </Connect>
-</Response>`.trim();
+</Response>`;
 
   res.set("Content-Type", "text/xml");
-  res.send(twiml);
+  res.status(200).send(twiml);
 });
 
-app.get("/", (_, res) => res.send("TaskSync Voice Bridge running"));
+// Optional: makes browser testing nicer
+app.get("/twilio/voice", (_req, res) => {
+  res.status(200).send("Twilio voice endpoint (POST required).");
+});
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: "/twilio/stream" });
+
+// WebSocket server for Twilio Media Streams
+const wss = new WebSocket.Server({ server, path: "/twilio/stream" });
 
 wss.on("connection", (twilioWs) => {
-  console.log("✅ Twilio stream connected");
+  console.log("✅ Twilio WS connected");
 
-  const model = process.env.OPENAI_MODEL || "gpt-realtime";
-  const apiKey = process.env.OPENAI_API_KEY;
-
-  if (!apiKey) {
-    console.log("❌ Missing OPENAI_API_KEY in Railway Variables");
-    try { twilioWs.close(); } catch {}
-    return;
-  }
-
-  const openaiWs = new WebSocket(
-    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`,
-    {
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-      },
-    }
-  );
-
+  let streamSid = null;
+  let openaiWs = null;
   let openaiReady = false;
-  const pendingAudio = [];
 
-  const sendToOpenAI = (obj) => {
-    if (openaiWs.readyState === WebSocket.OPEN) {
-      openaiWs.send(JSON.stringify(obj));
-    }
-  };
+  // Connect to OpenAI Realtime via WebSocket
+  const openaiUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_MODEL)}`;
 
-  openaiWs.on("open", () => {
-    openaiReady = true;
-    console.log("🧠 Connected to OpenAI Realtime");
-
-    // Match Twilio Media Streams audio: G.711 u-law (pcmu), 8kHz
-    sendToOpenAI({
-      type: "session.update",
-      session: {
-        output_modalities: ["audio"],
-        audio: {
-          input: {
-            format: { type: "audio/pcmu" },
-            turn_detection: { type: "semantic_vad" },
-          },
-          output: {
-            format: { type: "audio/pcmu" },
-            voice: "marin",
-          },
-        },
-        instructions:
-          "Du er TaskSync AI, en ekstremt profesjonell resepsjonist i Norge. " +
-          "Snakk naturlig norsk, kort og menneskelig. " +
-          "Start alltid med: 'Hei! Jeg er TaskSync AI. Hvordan kan jeg hjelpe deg i dag?' " +
-          "Hvis kunden vil booke: spør om tjeneste, ønsket dato og cirka tidspunkt. " +
-          "Ikke finn på priser eller tider.",
-      },
-    });
-
-    // Start samtalen med en gang (så det ikke blir stille)
-    sendToOpenAI({
-      type: "response.create",
-      response: { modalities: ["audio"] },
-    });
-
-    // Flush audio som kom før OpenAI var klar
-    while (pendingAudio.length) {
-      sendToOpenAI({ type: "input_audio_buffer.append", audio: pendingAudio.shift() });
-    }
+  openaiWs = new WebSocket(openaiUrl, {
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "OpenAI-Beta": "realtime=v1",
+    },
   });
 
-  openaiWs.on("message", (msg) => {
-    let data;
+  openaiWs.on("open", () => {
+    console.log("✅ Connected to OpenAI Realtime");
+
+    // IMPORTANT: session.type is REQUIRED ("realtime")
+    // Twilio Media Streams audio is g711_ulaw (μ-law 8k). Configure session to match.
+    const sessionUpdate = {
+      type: "session.update",
+      session: {
+        type: "realtime",
+        modalities: ["audio"], // allow audio responses
+        input_audio_format: "g711_ulaw",
+        output_audio_format: "g711_ulaw",
+        // Server VAD: model replies when caller stops speaking
+        turn_detection: { type: "server_vad" },
+        // Voice + behavior via instructions
+        instructions:
+          "Du er TaskSync AI, en profesjonell norsk kundeservice-assistent. " +
+          "Svar kort, naturlig og hjelpsomt på norsk. Still oppfølgingsspørsmål hvis nødvendig. " +
+          "Hvis kunden vil booke, spør etter navn, dato, klokkeslett og tjeneste.",
+      },
+    };
+
+    openaiWs.send(JSON.stringify(sessionUpdate));
+    openaiReady = true;
+  });
+
+  openaiWs.on("message", (data) => {
+    let msg;
     try {
-      data = JSON.parse(msg.toString());
-    } catch {
-      console.log("OpenAI non-json message");
+      msg = JSON.parse(data.toString());
+    } catch (e) {
       return;
     }
 
-    // Debug events (ikke spam deltas)
-    if (data.type && !String(data.type).includes("delta")) {
-      console.log("OpenAI event:", data.type);
+    // Debug (kan kommenteres ut senere)
+    if (msg.type === "error") {
+      console.error("❌ OpenAI error:", msg.error || msg);
+      return;
     }
 
-    if (data.type === "error") {
-      console.log("❌ OpenAI error:", data.error);
+    // Audio deltas from OpenAI -> send back to Twilio
+    // In Realtime docs this event name is response.output_audio.delta
+    if (msg.type === "response.output_audio.delta" && msg.delta) {
+      if (!streamSid) return;
+
+      const twilioMedia = {
+        event: "media",
+        streamSid,
+        media: { payload: msg.delta }, // already base64 g711_ulaw
+      };
+      twilioWs.send(JSON.stringify(twilioMedia));
     }
 
-    // OpenAI audio -> Twilio
-    if (data.type === "response.output_audio.delta") {
-      twilioWs.send(
-        JSON.stringify({
-          event: "media",
-          media: { payload: data.delta }, // base64 audio/pcmu
-        })
-      );
+    // Optional logging
+    if (msg.type === "session.updated") {
+      console.log("🟣 session.updated");
     }
-
-    // Når OpenAI oppfatter at brukeren stoppet å snakke, be om svar
-    if (data.type === "input_audio_buffer.speech_stopped") {
-      sendToOpenAI({ type: "response.create", response: { modalities: ["audio"] } });
+    if (msg.type === "response.created") {
+      console.log("🟣 response.created");
+    }
+    if (msg.type === "response.done") {
+      // console.log("🟣 response.done");
     }
   });
 
-  // Twilio audio -> OpenAI
+  openaiWs.on("close", () => {
+    console.log("⚠️ OpenAI WS closed");
+    try {
+      twilioWs.close();
+    } catch {}
+  });
+
+  openaiWs.on("error", (err) => {
+    console.error("❌ OpenAI WS error:", err?.message || err);
+    try {
+      twilioWs.close();
+    } catch {}
+  });
+
+  // Twilio -> OpenAI
   twilioWs.on("message", (msg) => {
     let data;
     try {
@@ -147,40 +164,50 @@ wss.on("connection", (twilioWs) => {
     }
 
     if (data.event === "start") {
-      console.log("▶️ start", data.start?.streamSid);
+      streamSid = data.start?.streamSid;
+      console.log("🎧 Twilio stream start:", streamSid);
       return;
     }
 
     if (data.event === "media") {
-      const b64 = data.media?.payload;
-      if (!b64) return;
+      // Twilio sends base64 g711_ulaw audio
+      const payload = data.media?.payload;
+      if (!payload || !openaiWs || openaiWs.readyState !== WebSocket.OPEN || !openaiReady) return;
 
-      if (!openaiReady) pendingAudio.push(b64);
-      else sendToOpenAI({ type: "input_audio_buffer.append", audio: b64 });
-
+      // Append audio into OpenAI input buffer
+      openaiWs.send(
+        JSON.stringify({
+          type: "input_audio_buffer.append",
+          audio: payload,
+        })
+      );
       return;
     }
 
     if (data.event === "stop") {
-      console.log("⏹ Twilio stop");
-      // Ikke lukk OpenAI her – la close håndteres under.
+      console.log("🛑 Twilio stream stop");
+      try {
+        openaiWs.close();
+      } catch {}
       return;
     }
   });
 
-  openaiWs.on("close", (code, reason) => {
-    console.log("🧠 OpenAI WS closed", code, reason?.toString());
-  });
-
-  openaiWs.on("error", (e) => {
-    console.log("❌ OpenAI WS error", e?.message || e);
-  });
-
   twilioWs.on("close", () => {
-    console.log("🔌 Twilio stream closed");
-    try { openaiWs.close(); } catch {}
+    console.log("⚠️ Twilio WS closed");
+    try {
+      openaiWs?.close();
+    } catch {}
+  });
+
+  twilioWs.on("error", (err) => {
+    console.error("❌ Twilio WS error:", err?.message || err);
+    try {
+      openaiWs?.close();
+    } catch {}
   });
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Listening on ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`🚀 TaskSync AI voice bridge running on :${PORT}`);
+});
