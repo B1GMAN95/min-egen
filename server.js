@@ -18,7 +18,7 @@ app.post("/twilio/voice", (req, res) => {
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say language="nb-NO">Hei! Du snakker med TaskSync AI.</Say>
+
   <Connect>
     <Stream url="${streamUrl}" />
   </Connect>
