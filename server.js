@@ -6,7 +6,6 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-realtime";
 const PORT = Number(process.env.PORT || 3000);
 
-// Crash-sikker logging (så Railway ikke bare dør “silent”)
 process.on("uncaughtException", (err) => console.error("🔥 uncaughtException:", err));
 process.on("unhandledRejection", (reason) => console.error("🔥 unhandledRejection:", reason));
 
@@ -18,17 +17,24 @@ app.get("/", (_req, res) => res.status(200).send("TaskSync AI voice bridge is ru
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 /**
- * Twilio hits this URL (POST) on inbound call.
- * We respond with TwiML that starts a Media Stream to our WS.
+ * IMPORTANT:
+ * We enable Twilio speech recognition on the Media Stream.
+ * Then we only let AI respond AFTER Twilio sends speech_final (meaning user finished).
  */
 app.post("/twilio/voice", (req, res) => {
   const host = req.headers["x-forwarded-host"] || req.headers.host;
   const streamUrl = `wss://${host}/twilio/stream`;
 
+  // speechTimeout="auto" helps Twilio decide end-of-utterance
+  // language set to nb-NO for Norwegian
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="${streamUrl}" />
+    <Stream url="${streamUrl}">
+      <Parameter name="speechRecognition" value="true"/>
+      <Parameter name="language" value="nb-NO"/>
+      <Parameter name="speechTimeout" value="auto"/>
+    </Stream>
   </Connect>
 </Response>`;
 
@@ -39,33 +45,20 @@ app.post("/twilio/voice", (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/twilio/stream" });
 
-/**
- * Helper: small delay before we ask the model to answer, to reduce “talking over”.
- */
-const THINKING_DELAY_MS = 350;
-
-/**
- * Stronger system instructions: less interruption + always confirm date/time.
- */
 const SYSTEM_INSTRUCTIONS = `
-Du er TaskSync AI, en profesjonell norsk resepsjonist som tar imot telefoner.
+Du er TaskSync AI, en profesjonell norsk resepsjonist.
 
-VIKTIG (må følges):
-- Avbryt aldri kunden. Vent til kunden er HELT ferdig med å snakke før du svarer.
-- Hvis kunden sier “mhmm”, “eh”, “vent”, “bare”, eller tar en kort pause: IKKE svar. Vent.
-- Når kunden ber om booking: ALDRI bekreft endelig før du har oppsummert og fått bekreftelse.
-- Tid/dato: Gjenta tilbake nøyaktig dato og klokkeslett og spør “Stemmer det?” før du låser det.
-- Hvis kunden sier “neste uke” er det uklart: spør hvilken dag (mandag–søndag) og dato hvis mulig.
-- Bruk alltid 24-timers klokke (f.eks. 17:00).
-- Hvis du er usikker (f.eks. hørte 16:00/17:00): spør igjen. Ikke gjett.
-- Når du oppfatter en tid, les den tilbake tydelig: “klokken sytten null null (17:00)”.
+KRITISK:
+- Avbryt ALDRI kunden.
+- Vent alltid til kunden er helt ferdig. Ikke svar på “mhmm”, små pauser eller tenking.
+- Når kunden ber om booking: Oppsummer og få bekreftelse før du låser tid.
+- “Neste uke” er uklart: spør hvilken dag og helst dato.
+- Tid: gjenta tydelig (f.eks. “17:00”) og spør “Stemmer det?” før booking.
 
 Stil:
-- Varm, rolig og menneskelig.
-- Små bekreftelser (“skjønner”, “mm”) kun ETTER at kunden er ferdig (aldri midt i setningen).
-- Kortfattede svar.
-
-Start samtalen med:
+- Rolig, menneskelig, vennlig.
+- Ikke “overprat”.
+Start med:
 “Hei! Jeg er TaskSync AI. Hvordan kan jeg hjelpe deg i dag?”
 `.trim();
 
@@ -80,7 +73,11 @@ wss.on("connection", (twilioWs) => {
 
   let streamSid = null;
   let openaiReady = false;
-  let pendingResponseTimer = null;
+
+  // Buffer + gating: AI får kun snakke når vi sier "go"
+  let canRespond = false;
+  let lastFinalText = "";
+  let respondTimer = null;
 
   const openaiWs = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_MODEL)}`,
@@ -93,9 +90,7 @@ wss.on("connection", (twilioWs) => {
   );
 
   const sendToOpenAI = (obj) => {
-    if (openaiWs.readyState === WebSocket.OPEN) {
-      openaiWs.send(JSON.stringify(obj));
-    }
+    if (openaiWs.readyState === WebSocket.OPEN) openaiWs.send(JSON.stringify(obj));
   };
 
   const sendAudioToTwilio = (base64Audio) => {
@@ -109,38 +104,51 @@ wss.on("connection", (twilioWs) => {
     );
   };
 
-  const scheduleResponseCreate = () => {
-    if (!openaiReady) return;
-    if (pendingResponseTimer) clearTimeout(pendingResponseTimer);
-    pendingResponseTimer = setTimeout(() => {
+  const scheduleRespond = (ms = 1000) => {
+    if (respondTimer) clearTimeout(respondTimer);
+    respondTimer = setTimeout(() => {
+      canRespond = true;
+
+      // Tell OpenAI: user text (final transcript) as context, then respond
+      if (lastFinalText?.trim()) {
+        sendToOpenAI({
+          type: "conversation.item.create",
+          item: {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: lastFinalText.trim() }],
+          },
+        });
+      }
+
       sendToOpenAI({ type: "response.create" });
-    }, THINKING_DELAY_MS);
+
+      // reset
+      lastFinalText = "";
+    }, ms);
   };
 
   openaiWs.on("open", () => {
     console.log("✅ Connected to OpenAI Realtime");
 
-    // Your account requires ["audio","text"]
     sendToOpenAI({
       type: "session.update",
       session: {
         modalities: ["audio", "text"],
         input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
-
-        // server_vad keeps it natural, but we slow replies with THINKING_DELAY_MS
-        turn_detection: { type: "server_vad" },
-
-        // Voice (you can try "marin" / "cedar" depending on availability)
+        // IMPORTANT: we DO NOT rely on server_vad for when to answer
+        // We only answer when Twilio says speech_final.
+        turn_detection: { type: "disabled" },
         voice: "marin",
-
         instructions: SYSTEM_INSTRUCTIONS,
       },
     });
 
     openaiReady = true;
 
-    // Force greeting immediately
+    // Greeting
+    canRespond = true;
     sendToOpenAI({ type: "response.create" });
   });
 
@@ -157,26 +165,20 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
-    // Audio deltas (support multiple schemas)
+    // Only play AI audio when we allow responding (prevents talking over user)
     if (
       (msg.type === "response.output_audio.delta" || msg.type === "response.audio.delta") &&
       msg.delta
     ) {
-      // console.log("🔊 OpenAI audio delta");
+      if (!canRespond) return;
       sendAudioToTwilio(msg.delta);
       return;
     }
 
-    // When model thinks user finished speaking, ask it to respond (after short delay)
-    if (msg.type === "input_audio_buffer.speech_stopped") {
-      // console.log("🟣 speech_stopped");
-      scheduleResponseCreate();
+    // Once a response is done, lock until next speech_final
+    if (msg.type === "response.done") {
+      canRespond = false;
       return;
-    }
-
-    // Optional: debug text output
-    if (msg.type === "response.output_text.delta" && msg.delta) {
-      process.stdout.write(msg.delta);
     }
   });
 
@@ -190,7 +192,13 @@ wss.on("connection", (twilioWs) => {
     try { twilioWs.close(); } catch {}
   });
 
-  // Twilio -> OpenAI audio
+  /**
+   * Twilio message types we care about:
+   * - start
+   * - media (audio)
+   * - speech (partial transcript)
+   * - speech_final (final transcript)
+   */
   twilioWs.on("message", (raw) => {
     let data;
     try {
@@ -202,16 +210,39 @@ wss.on("connection", (twilioWs) => {
     if (data.event === "start") {
       streamSid = data.start?.streamSid;
       console.log("🎧 Twilio stream start:", streamSid);
+      canRespond = false; // user may speak
       return;
     }
 
+    // Always feed audio to OpenAI (for best understanding)
     if (data.event === "media") {
       const payload = data.media?.payload;
       if (!payload) return;
       if (!openaiReady) return;
 
-      // Append caller audio
+      // User is speaking -> do NOT let AI speak
+      canRespond = false;
+
       sendToOpenAI({ type: "input_audio_buffer.append", audio: payload });
+      return;
+    }
+
+    // If Twilio provides transcripts:
+    if (data.event === "speech") {
+      // partial transcript - ignore for responding
+      return;
+    }
+
+    if (data.event === "speech_final") {
+      // This is the key: user finished speaking
+      const finalText = data.speech?.transcript || data.transcript || "";
+      if (finalText.trim()) {
+        console.log("🗣️ speech_final:", finalText.trim());
+        lastFinalText = finalText.trim();
+      }
+
+      // Wait 1.0s after final to ensure user is truly done
+      scheduleRespond(1100);
       return;
     }
 
@@ -233,7 +264,6 @@ wss.on("connection", (twilioWs) => {
   });
 });
 
-// Railway-safe listen
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 TaskSync AI voice bridge running on :${PORT}`);
 });
