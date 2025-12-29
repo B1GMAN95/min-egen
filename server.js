@@ -69,7 +69,6 @@ wss.on("connection", (twilioWs) => {
       JSON.stringify({
         type: "session.update",
         session: {
-          type: "realtime",
           modalities: ["audio"],
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
