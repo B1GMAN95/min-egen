@@ -1,19 +1,18 @@
-{
-  "name": "tasksync-voice-bridge",
-  "version": "1.0.0",
-  "description": "Railway backend for TaskSync AI voice demo (OpenAI Realtime token bridge)",
-  "main": "server.js",
-  "type": "module",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "engines": {
-    "node": ">=18"
-  },
-  "dependencies": {
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.18.2",
-    "node-fetch": "^3.3.2"
-  }
-}
+import express from "express";
+import cors from "cors";
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+app.get("/", (req, res) => res.status(200).send("OK"));
+
+app.post("/voice/token", async (req, res) => {
+  // Placeholder: later we generate ephemeral client_secret here
+  res.status(200).json({ ok: true, note: "token endpoint placeholder" });
+});
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 TaskSync voice gateway running on :${PORT}`);
+});
